@@ -82,7 +82,7 @@ jobs:
       - name: Push
         run: docker push "$DOCKER_PUBLISH_TAG"
 
-  publish:
+  github:
 
     needs: [ verify, docker ]
     runs-on: ubuntu-latest
@@ -154,4 +154,22 @@ jobs:
           git push
         env:
           TARGET_REF: ${{ steps.base-ref.outputs.name }}
+
+  crates-io:
+    needs: github
+    environment: "crates.io"
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/checkout@v4
+        with:
+          ref: "v${{ env.RELEASE_VERSION }}"
+
+      - name: cargo login
+        run: cargo login <<<"$CRATESIO_API_TOKEN"
+        env:
+          CRATESIO_API_TOKEN: ${{ secrets.CRATESIO_API_TOKEN }}
+
+      - name: Publish
+        run: cargo publish
 

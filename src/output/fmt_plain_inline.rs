@@ -3,24 +3,30 @@ use crate::md_elem::*;
 use crate::output::fmt_plain_writer::NewlineCollapser;
 use std::io::{Error, LineWriter, Write};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlainWriterOptions {
     pub include_breaks: bool,
 }
 
+/// A struct for writing [MdElem]s as plain text (as per `--output plain`)
+///
+/// This generally strips all Markdown-y aspects of from the elements, and leaves only the core text. For example,
+/// `_emphasized text_` will be rendered simply as `"emphasized text"`, and `- a list` will be rendered just as
+/// "`a list"`.
+///
+/// Links and images will have their URLs removed, leaving only the display/alt text.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlainWriter {
     options: PlainWriterOptions,
 }
 
 impl PlainWriter {
+    /// Create a new `PlainWriter` with the given options
     pub fn with_options(options: PlainWriterOptions) -> Self {
         Self { options }
     }
 
-    pub fn options(&mut self) -> &mut PlainWriterOptions {
-        &mut self.options
-    }
-
+    /// Writes the given nodes to the given writer.
     pub fn write<'md, I, W>(&self, nodes: I, out: &mut W)
     where
         I: IntoIterator<Item = &'md MdElem>,
@@ -103,7 +109,7 @@ where
             write_inlines(out, &s.title)?;
             writeln!(out)?;
             writeln!(out)?;
-            write_plain_result(out, s.body.iter().map(|e| e.into()))
+            write_plain_result(out, s.body.iter())
         }
         MdElem::Table(t) => {
             for row in &t.rows {
@@ -160,7 +166,7 @@ where
         Inline::Footnote(_) => Ok(()),
         Inline::Span(Span { children, .. }) => write_inlines(out, children),
         Inline::Image(Image { alt, .. }) => write!(out, "{alt}"),
-        Inline::Link(Link { text, .. }) => write_inlines(out, text),
+        Inline::Link(Link { display: text, .. }) => write_inlines(out, text),
         Inline::Text(Text { value, .. }) => write!(out, "{value}"),
     }
 }
@@ -465,8 +471,8 @@ mod test {
     #[test]
     fn link() {
         let link = Link {
-            text: vec![mdq_inline!("display text")],
-            link_definition: LinkDefinition {
+            display: vec![mdq_inline!("display text")],
+            link: LinkDefinition {
                 url: "https://example.com".to_string(),
                 title: Some("the title".to_string()),
                 reference: LinkReference::Inline,
@@ -526,8 +532,8 @@ mod test {
                 mdq_inline!(span Emphasis [mdq_inline!("world")]),
                 mdq_inline!("! sponsored by "),
                 Inline::Link(Link {
-                    text: vec![mdq_inline!("Example Corp")],
-                    link_definition: LinkDefinition {
+                    display: vec![mdq_inline!("Example Corp")],
+                    link: LinkDefinition {
                         url: "https://example.com".to_string(),
                         title: None,
                         reference: LinkReference::Inline
@@ -537,7 +543,7 @@ mod test {
             ]
         });
         check_plain(
-            MdElem::from(md),
+            md,
             Expect {
                 with_breaks: "hello world! sponsored by Example Corp.\n",
                 no_breaks: "hello world! sponsored by Example Corp.\n",
