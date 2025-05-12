@@ -1,3 +1,9 @@
+//! The query and filtering ability of mdq.
+//!
+//! The main item here is [`Selector`]:
+//!
+//! - Parse text into `Selector` using `try_into`.
+//! - Run it against an [`MdDoc`](crate::md_elem::MdDoc) using [`Selector::find_nodes`].
 mod api;
 mod match_selector;
 mod matcher;
@@ -11,6 +17,8 @@ mod sel_table;
 mod selector;
 mod string_matcher;
 
-pub use api::*;
+pub(crate) use api::*;
+
+pub use crate::query::ParseError;
 pub use matcher::*;
 pub use selector::*;

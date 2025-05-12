@@ -1,3 +1,4 @@
+use crate::md_elem::concatenate::Concatenate;
 use std::backtrace::Backtrace;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -8,8 +9,24 @@ use std::vec::IntoIter;
 use elem::*;
 use markdown::mdast;
 
-// If we ever need any additional document-wide state, we can rename this
-#[derive(Debug, PartialEq)]
+/// Additional context for navigating or parsing a Markdown document.
+///
+/// The main functionality this exposes is [`MdContext::get_footnote`], which lets you look up a footnote's contents by
+/// its id. Footnotes can contain loops, such as:
+///
+/// ```markdown
+/// This is my footnote[^1].
+///
+/// [^1]: Note that it contains a cycle[^2].
+/// [^2]: This cycles back to the first footnote[^1].
+/// ```
+///
+/// That means we can't contain them fully within an MdElem without some external state to hold the links. This is that
+/// state.
+///
+/// See [`elem::FootnoteId`](FootnoteId) for an example showing how footnotes get parsed, and how to use the context to
+/// fetch them.
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct MdContext {
     footnotes: HashMap<FootnoteId, Vec<MdElem>>,
 
@@ -18,12 +35,16 @@ pub struct MdContext {
 }
 
 impl MdContext {
+    /// Gets a footnote's contents, given its id.
+    ///
+    /// The id does _not_ include the caret: footnote `[^1]` will have id `"1"`.
+    ///
+    /// See [`elem::FootnoteId`](FootnoteId) for an example showing how footnotes get parsed, and how to use the context
+    /// to fetch them.
     pub fn get_footnote(&self, footnote_id: &FootnoteId) -> &Vec<MdElem> {
         self.footnotes.get(footnote_id).unwrap_or(&self.empty_md_elems)
     }
-}
 
-impl MdContext {
     fn new() -> Self {
         Self {
             footnotes: HashMap::with_capacity(4), // total guess
@@ -32,13 +53,72 @@ impl MdContext {
     }
 }
 
+/// A fully parsed Markdown document.
+///
+/// This comprises the root (top-level) [MdElem]s, as well as the [MdContext] for navigating footnotes.
+///
+/// See [`MdDoc::parse`] how to create one.
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct MdDoc {
     pub roots: Vec<MdElem>,
     pub ctx: MdContext,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+impl MdDoc {
+    /// Parse some Markdown into.
+    ///
+    /// See the various examples in [`elem`] for examples of this parsing in action.
+    pub fn parse(text: &str, options: &ParseOptions) -> Result<Self, InvalidMd> {
+        parse0(text, options)
+    }
+}
+
+/// A single node of the parsed Markdown.
+///
+/// These come in three flavors:
+///
+/// - block container nodes, which contain other `MdElem`s within them
+/// - inline container nodes, which contain [`Inline`]s
+/// - leaf nodes, which are scalars and represent the leaf nodes of the tree
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MdElem {
+    /// Block container: A full Markdown document, or contiguous section of one.
+    ///
+    /// This is distinct from just a `Vec<MdElem>` in that `Doc` represents a single document, while `Vec<MdElem>`
+    /// represents a stream of elements. For example, if you had:
+    ///
+    /// ```markdown
+    /// # First section
+    ///
+    /// Some text
+    ///
+    /// - a list item
+    /// - another list item
+    ///
+    /// More text.
+    ///
+    /// # Second section
+    ///
+    /// And so on.
+    /// ```
+    ///
+    /// Then that whole thing can be represented by a single `Doc` with two elements (both [`MdElem::Section`]s).
+    /// Additionally, the body of each section is also a `Doc`. The `Doc` for the first section is:
+    ///
+    /// ```markdown
+    /// Some text
+    ///
+    /// - a list item
+    /// - another list item
+    ///
+    /// More text.
+    /// ```
+    ///
+    /// On the other hand, if you select list items containing the word "item", you'll get a `Vec<MdElem>` (_not_ a
+    /// `Doc`) containing two items, one for each list item.
+    ///
+    /// Concretely: When mdq outputs the Markdown, it can (if requested) put thematic breaks or newlines between each
+    /// element of a `Vec<MdElem>`, but it will not do that for the elements within a `Doc`.
     Doc(Vec<MdElem>),
 
     // Container blocks
@@ -50,13 +130,30 @@ pub enum MdElem {
     CodeBlock(CodeBlock),
     Paragraph(Paragraph),
     Table(Table),
+    /// A thematic break:
+    ///
+    /// ```markdown
+    /// -----
+    /// ```
+    ///
+    /// Note that there are several styles of thematic break. mdq unifies them at parse time, which results in some
+    /// information loss; you can't necessarily reconstruct the original Markdown.
     ThematicBreak,
     Inline(Inline),
     BlockHtml(BlockHtml),
 }
 
+/// Options for parsing Markdown.
+///
+/// See: [`MdDoc::parse`].
+#[derive(Default, Debug)]
 pub struct ParseOptions {
     pub(crate) mdast_options: markdown::ParseOptions,
+    /// Usually only required for debugging. Defaults to `false`.
+    ///
+    /// If mdq encounters an unexpected state coming from the underlying parsing library it uses, it can either ignore
+    /// it or error out. If this field is set to `true`, mdq will ignore the unexpected state. Otherwise,
+    /// [`MdDoc::parse`] will return an `Err` containing [`InvalidMd::UnknownMarkdown`].
     pub allow_unknown_markdown: bool,
 }
 
@@ -69,7 +166,8 @@ impl ParseOptions {
     }
 }
 
-pub fn parse(text: &str, options: &ParseOptions) -> Result<MdDoc, InvalidMd> {
+/// Parse some Markdown text.
+fn parse0(text: &str, options: &ParseOptions) -> Result<MdDoc, InvalidMd> {
     let ast = markdown::to_mdast(text, &options.mdast_options).map_err(|e| InvalidMd::ParseError(format!("{e}")))?;
     let read_options = ReadOptions {
         validate_no_conflicting_links: false,
@@ -78,6 +176,7 @@ pub fn parse(text: &str, options: &ParseOptions) -> Result<MdDoc, InvalidMd> {
     MdDoc::read(ast, &read_options)
 }
 
+#[derive(Default)]
 pub(crate) struct ReadOptions {
     /// For links and images, enforce that reference-style links have at most one definition. If this value is
     /// `false` and a link has multiple definitions, the first one will be picked.
@@ -104,29 +203,70 @@ pub(crate) struct ReadOptions {
     pub allow_unknown_markdown: bool,
 }
 
-#[derive(Debug, PartialEq)]
+/// Various error conditions that can come from trying to parse Markdown.
+#[derive(Debug, PartialEq, Eq)]
 pub enum InvalidMd {
-    Unsupported(mdast::Node),
-    NonListItemDirectlyUnderList(mdast::Node),
-    NonRowDirectlyUnderTable(mdast::Node),
+    /// Encountered a Markdown component that mdq doesn't support.
+    ///
+    /// This is typically an extension for a particular Markdown variant which mdq knows about, but does not handle.
+    Unsupported(MarkdownPart),
+
+    /// Internal error. You shouldn't get this.
+    NonListItemDirectlyUnderList(MarkdownPart),
+    /// Internal error. You shouldn't get this.
+    NonRowDirectlyUnderTable(MarkdownPart),
+    /// Internal error. You shouldn't get this.
     NonInlineWhereInlineExpected(MdElem),
+    /// Internal error. You shouldn't get this.
     MissingReferenceDefinition(String),
+    /// Internal error. You shouldn't get this.
     ConflictingReferenceDefinition(String),
-    InternalError(InternalErrorState),
+    /// Internal error. You shouldn't get this.
+    InternalError(UnknownMdParseError),
+    /// Internal error. You shouldn't get this.
+    ///
+    /// See [`ParseOptions::allow_unknown_markdown`].
     UnknownMarkdown(&'static str),
+    /// Internal error. You shouldn't get this.
     ParseError(String),
 }
 
-/// A wrapper for [Backtrace] that implements [PartialEq] to always return `true`. This lets us use it in a struct
-/// while still letting us use `#[derive(PartialEq)]`
-#[derive(Debug)]
-pub struct InternalErrorState(Backtrace);
+impl std::error::Error for InvalidMd {}
 
-impl PartialEq for InternalErrorState {
+/// A portion of unparsable markdown.
+///
+/// This wraps the AST from the underlying library that mdq uses; the only thing you can really do with it is to use its
+/// `Debug`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownPart {
+    node: Box<mdast::Node>,
+}
+
+/// An unknown, internal error.
+///
+/// See [`InvalidMd::InternalError`].
+// A wrapper for [Backtrace] that implements [PartialEq] to always return `true`. This lets us use it in a struct
+// while still letting us use `#[derive(PartialEq)]`
+#[derive(Debug)]
+pub struct UnknownMdParseError {
+    backtrace: Backtrace,
+}
+
+impl Display for UnknownMdParseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.backtrace, f)
+    }
+}
+
+impl std::error::Error for UnknownMdParseError {}
+
+impl PartialEq for UnknownMdParseError {
     fn eq(&self, _other: &Self) -> bool {
         true
     }
 }
+
+impl Eq for UnknownMdParseError {}
 
 impl Display for InvalidMd {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -149,9 +289,9 @@ impl Display for InvalidMd {
             InvalidMd::ConflictingReferenceDefinition(id) => {
                 write!(f, "found multiple definitions for link/image/footnote: {}", id)
             }
-            InvalidMd::InternalError(backtrace) => {
+            InvalidMd::InternalError(err) => {
                 f.write_str("internal error\n")?;
-                std::fmt::Display::fmt(&backtrace.0, f)
+                std::fmt::Display::fmt(&err.backtrace, f)
             }
             InvalidMd::UnknownMarkdown(description) => {
                 write!(f, "encountered unknown markdown: {}\n\n", description)?;
@@ -168,31 +308,163 @@ impl Display for InvalidMd {
     }
 }
 
+/// Inner details of the [MdElem] variants.
+///
+/// This module includes the types that provide the details of [`md_elem::MdElem`](MdElem) variants, as well as
+/// supporting structs. There are four kinds of items in this module:
+///
+/// - **container markdown** structs, which represent Markdown elements that contain other block or inline structs.
+///
+/// - **leaf block markdown** structs, which represent Markdown elements that are rendered as blocks, but which cannot
+///   contain other blocks. Depending on the specific struct, it may include inline markdown elements, or just plain
+///   text.
+///
+/// - **inline markdown** structs, which represent Markdown elements that are rendered inline, and may contain other
+///   inline or terminal markdown elements.
+///
+/// - **terminal markdown** structs, which represent Markdown elements that cannot contain other inline structs.
+///
+/// - **supporting items**, which do not map to full Markdown elements, but are instead sub-components of Markdown
+///   elements. (These include things like text variants and link definitions).
 pub mod elem {
     use super::*;
-    use std::ops::Deref;
+    use std::mem;
 
+    /// A table row.
+    ///
+    /// This is just a `Vec` of table cells, but the type alias makes it much easier to reason about.
     pub type TableRow = Vec<TableCell>;
+
+    /// A table cell within a row.
+    ///
+    /// This is just a `Vec` of [Inline]s, but the type alias makes it much easier to reason about.
     pub type TableCell = Vec<Inline>;
 
-    #[derive(Debug, PartialEq, Hash, Clone)]
+    /// Different kinds of code blocks.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub enum CodeVariant {
+        /// A standard code block
+        ///
+        /// ````markdown
+        /// ```
+        /// foo()
+        /// ```
+        /// ````
+        ///
+        /// If the `Option<CodeOpts>` is `None`, this block has no metadata in the opening fence (as in the example
+        /// directly above). Otherwise, the first word directly after the backticks is the language, and the rest of
+        /// the string is the metadata:
+        ///
+        /// ````markdown
+        /// ```rust and some metadata
+        /// foo()
+        /// ```
+        /// ````
         Code(Option<CodeOpts>),
-        Math { metadata: Option<String> },
+        Math {
+            metadata: Option<String>,
+        },
         Toml,
         Yaml,
     }
 
+    /// Some inline text.
     #[derive(Debug, PartialEq, Eq, Hash, Clone)]
     pub enum Inline {
+        /// The marker for a footnote; this is a terminal node in the [MdElem] tree.
+        ///
+        /// ```markdown
+        /// [^1]
+        /// ```
+        ///
+        /// Note that this does not include the content of the footnote. To get that, use [`MdContext::get_footnote`].
         Footnote(FootnoteId),
+
+        /// A span of formatted text (~~deleted~~, _emphasized_, or **strong**).
+        ///
+        /// See [`Span`].
         Span(Span),
+
+        /// An image; this is a terminal node in the [MdElem] tree.
+        ///
+        /// ```markdown
+        /// ![alt text](https://example.com/hello-world.png)
+        /// ```
         Image(Image),
+
+        /// A link
+        ///
+        /// ```markdown
+        /// ![display text](https://example.com/hello-world)
+        /// ```
         Link(Link),
+
+        /// Some text; this is a terminal node in the [MdElem] tree.
         Text(Text),
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    impl Concatenate for Inline {
+        fn try_concatenate(&mut self, mut other: Self) -> Result<(), Self> {
+            match (self, &mut other) {
+                (Self::Span(my), Self::Span(other)) if my.variant == other.variant => {
+                    // Combine span(my) + span(other) into span(my+other)
+                    // But my and other are also spans, and now that they're concatenated, we may have elements that
+                    // are newly concatenable. So, recurse!
+                    my.children.append(&mut other.children);
+                    my.children = Concatenate::concatenate_similar(mem::take(&mut my.children));
+                    Ok(())
+                }
+                (Self::Text(my), Self::Text(other))
+                    if my.variant == TextVariant::Plain && other.variant == TextVariant::Plain =>
+                {
+                    // Only combine plaintext; other text elements have semantic meaning that may be lost.
+                    // For example, two expressions `x + y` and `1 + 2` don't imply `x + y 1 + 2`
+                    my.value.push_str(&other.value);
+                    Ok(())
+                }
+                _ => Err(other),
+            }
+        }
+    }
+
+    /// Leaf block markdown representing block-level HTML.
+    ///
+    /// These are `<tag>`s that start a line. The exact rules are somewhat involved (see:
+    /// <https://spec.commonmark.org/0.31.2/#html-blocks>), but basically these are non-inlined html tags.
+    ///
+    /// The [`BlockHtml::value`] includes the opening and closing tags, and any text between them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// <div>
+    ///
+    /// My div content
+    ///
+    /// </div>
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected_html_1 = BlockHtml{value: "<div>".to_string()};
+    /// let expected_html_2 = BlockHtml{value: "</div>".to_string()};
+    ///
+    /// let expected_full_md = vec![
+    ///     MdElem::BlockHtml(expected_html_1),
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![Inline::Text(Text{
+    ///             variant: TextVariant::Plain,
+    ///             value: "My div content".to_string(),
+    ///         })]
+    ///     }),
+    ///     MdElem::BlockHtml(expected_html_2),
+    /// ];
+    /// assert_eq!(parsed.roots, expected_full_md);
+    /// ```
+    ///
+    /// c.f. [`TextVariant::InlineHtml`]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct BlockHtml {
         pub value: String,
     }
@@ -203,31 +475,245 @@ pub mod elem {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Inline markdown representing formatted text (~~deleted~~, _emphasized_, or **strong**).
+    ///
+    /// The span's body is a `Vec<Inline>`, so you can have nested spans, emphasized link text, etc.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// Some _text **with** ~deletes~_.
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// /// helper
+    /// fn plain_text(text: &str) -> Inline {
+    ///     Inline::Text(Text{
+    ///         variant: TextVariant::Plain,
+    ///         value: text.to_string()
+    ///     })
+    /// }
+    ///
+    /// let expected_deleted = Span{
+    ///     variant: SpanVariant::Delete,
+    ///     children: vec![plain_text("deletes")],
+    /// };
+    /// let expected_strong = Span{
+    ///     variant: SpanVariant::Strong,
+    ///     children: vec![plain_text("with")],
+    /// };
+    /// let expected_emphasis = Span{
+    ///     variant: SpanVariant::Emphasis,
+    ///     children: vec![
+    ///         // Unlike the above examples, this one happens to have
+    ///         // some nested spans.
+    ///         plain_text("text "),
+    ///         Inline::Span(expected_strong),
+    ///         plain_text(" "),
+    ///         Inline::Span(expected_deleted),
+    ///     ],
+    /// };
+    ///
+    /// let expected_full_md = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![
+    ///             plain_text("Some "),
+    ///             Inline::Span(expected_emphasis),
+    ///             plain_text("."),
+    ///         ]
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected_full_md);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Span {
         pub variant: crate::md_elem::tree::elem::SpanVariant,
         pub children: Vec<crate::md_elem::tree::elem::Inline>,
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Terminal markdown representing an atomic chunk of text.
+    ///
+    /// This is not just for plain text: inline code, inline HTML, and inline math also get parsed as `Text`. The thing
+    /// that defines elements as `Text` (as opposed to [`Span`]) is that they cannot have other elements nested in them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// Hello, `robots`. <em>And now with gusto!</em>
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected_plain_text = Text{
+    ///     variant: TextVariant::Plain,
+    ///     value: "Hello, ".to_string(),
+    /// };
+    /// let expected_inline_code = Text{
+    ///     variant: TextVariant::Code,
+    ///     value: "robots".to_string(),
+    /// };
+    /// let expected_inline_html_open = Text{
+    ///     variant: TextVariant::InlineHtml,
+    ///     value: "<em>".to_string(),
+    /// };
+    /// let expected_inline_html_contents = Text{
+    ///     variant: TextVariant::Plain,
+    ///     value: "And now with gusto!".to_string(),
+    /// };
+    /// let expected_inline_html_close = Text{
+    ///     variant: TextVariant::InlineHtml,
+    ///     value: "</em>".to_string(),
+    /// };
+    ///
+    /// let expected_full_md = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![
+    ///             Inline::Text(expected_plain_text),
+    ///             Inline::Text(expected_inline_code),
+    ///             Inline::Text(Text{
+    ///                 variant: TextVariant::Plain,
+    ///                 value: ". ".to_string(),
+    ///             }),
+    ///             Inline::Text(expected_inline_html_open),
+    ///             Inline::Text(expected_inline_html_contents),
+    ///             Inline::Text(expected_inline_html_close),
+    ///         ],
+    ///     })
+    /// ];
+    /// assert_eq!(parsed.roots, expected_full_md);
+    /// ```
+    ///
+    /// See [`Inline::Text`]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Text {
         pub variant: crate::md_elem::tree::elem::TextVariant,
         pub value: String,
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Inline markdown representing a link.
+    ///
+    /// (Note that this struct is inline markdown, while the similar [`Image`] is terminal. That's because a link's
+    /// display text can include other inline elements, while image alt text is always just plain text.)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// [the display text](https://example.com/link.html)
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected_link = Link {
+    ///     display: vec![Inline::Text(Text{
+    ///         variant: TextVariant::Plain,
+    ///         value: "the display text".to_string(),
+    ///     })],
+    ///     link: LinkDefinition{
+    ///         url: "https://example.com/link.html".to_string(),
+    ///         title: None,
+    ///         reference: LinkReference::Inline,
+    ///     }
+    /// };
+    ///
+    /// let expected = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![Inline::Link(expected_link)]
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ```
+    ///
+    /// See [`Inline::Link`]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Link {
-        pub text: Vec<crate::md_elem::tree::elem::Inline>,
-        pub link_definition: crate::md_elem::tree::elem::LinkDefinition,
+        pub display: Vec<crate::md_elem::tree::elem::Inline>,
+        pub link: crate::md_elem::tree::elem::LinkDefinition,
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Terminal markdown inline image.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// ![the alt text](https://example.com/image.png)
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected_image = Image {
+    ///     alt: "the alt text".to_string(),
+    ///     link: LinkDefinition{
+    ///         url: "https://example.com/image.png".to_string(),
+    ///         title: None,
+    ///         reference: LinkReference::Inline,
+    ///     }
+    /// };
+    ///
+    /// let expected = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![Inline::Image(expected_image)]
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ```
+    ///
+    /// See [`Inline::Image`]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Image {
         pub alt: String,
         pub link: crate::md_elem::tree::elem::LinkDefinition,
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Terminal markdown representing the id for a footnote.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// This is[^1] some text.
+    ///
+    /// [^1]: the footnote text
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected_footnote_id = FootnoteId{id: "1".to_string()}; // Note: does not include the caret
+    ///
+    /// let expected_footnote_contents = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![Inline::Text(Text{
+    ///             variant: TextVariant::Plain,
+    ///             value: "the footnote text".to_string(),
+    ///         })],
+    ///     })
+    /// ];
+    ///
+    /// let expected_full_md = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![
+    ///             Inline::Text(Text{
+    ///                 variant: TextVariant::Plain,
+    ///                 value: "This is".to_string(),
+    ///             }),
+    ///             Inline::Footnote(expected_footnote_id.clone()),
+    ///             Inline::Text(Text{
+    ///                 variant: TextVariant::Plain,
+    ///                 value: " some text.".to_string(),
+    ///             }),
+    ///         ]
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected_full_md);
+    /// assert_eq!(parsed.ctx.get_footnote(&expected_footnote_id), &expected_footnote_contents);
+    /// ```
+    ///
+    /// See [`Inline::Footnote`] and [`MdContext::get_footnote`]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct FootnoteId {
         pub id: String,
     }
@@ -238,104 +724,455 @@ pub mod elem {
         }
     }
 
-    impl Deref for crate::md_elem::tree::elem::FootnoteId {
-        type Target = String;
-
-        fn deref(&self) -> &Self::Target {
+    impl crate::md_elem::tree::elem::FootnoteId {
+        /// Gets this footnote's reference id as a string.
+        ///
+        /// For example, given the markdown:
+        ///
+        /// # Examples
+        ///
+        /// ```markdown
+        /// Hello[^1], world.
+        ///
+        /// [^1]: this is a standard greeting
+        /// ```
+        ///
+        /// the `FootnoteId`'s `as_str()` would be `"^1"`.
+        pub fn as_str(&self) -> &str {
             &self.id
         }
-    }
 
-    impl crate::md_elem::tree::elem::FootnoteId {
         pub(crate) fn new(id: String, label: Option<String>) -> crate::md_elem::tree::elem::FootnoteId {
             let id = label.unwrap_or(id);
             Self { id }
         }
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Supporting struct representing the link in an [`Link`] or [`Image`].
+    ///
+    /// See those two types for examples.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct LinkDefinition {
+        /// The link's destination.
         pub url: String,
         /// If you have `[1]: https://example.com "my title"`, this is the "my title".
         ///
-        /// See: https://github.github.com/gfm/#link-reference-definitions
+        /// See: <https://github.github.com/gfm/#link-reference-definitions>
         pub title: Option<String>,
+        /// The link's reference style.
         pub reference: LinkReference,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Container markdown representing an item within a list.
+    ///
+    /// See [`List`] for examples.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct ListItem {
+        /// If `None`, this item is not a task. If `Some`, this is a task, with the bool representing whether it's
+        /// marked as completed.
         pub checked: Option<bool>,
         pub item: Vec<MdElem>,
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// ~~deleted~~, _emphasized_, or **strong**; see [`Span`]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum SpanVariant {
         Delete,
         Emphasis,
         Strong,
     }
 
-    #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+    /// Plain, `inline code`, or inline math text; see [`Text`]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum TextVariant {
+        /// Plain text
         Plain,
+
+        /// `inline code`
         Code,
+
+        /// $inline math$
         Math,
-        Html,
+
+        /// inline <span>html</span>
+        ///
+        /// Each tag (and not any text inside matching tags) is its own [`Inline::Text`], and the text's `value`
+        /// includes the angle brackets:
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use mdq::md_elem::{*, elem::*};
+        /// use mdq::md_elem::elem::{Inline, Paragraph, Text, TextVariant};
+        /// let md_elems = MdDoc::parse("inline <span>html</span>", &ParseOptions::gfm()).unwrap();
+        /// assert_eq!(1, md_elems.roots.len());
+        /// let MdElem::Paragraph(Paragraph{body}) = &md_elems.roots[0] else { panic!() };
+        /// assert_eq!(4, body.len());
+        /// assert_eq!(&Inline::Text(Text{variant: TextVariant::InlineHtml, value: "<span>".to_string()}), &body[1]);
+        /// ```
+        ///
+        /// c.f. [`BlockHtml`]
+        InlineHtml,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Container markdown representing a section title and its body.
+    ///
+    /// ```markdown
+    /// # This is a title with depth 1
+    ///
+    /// This is its body.
+    /// ```
+    ///
+    /// Note that many Markdown parsers treat Markdown as non-hierarchical: the title is a top-level node, and its
+    /// body is another top-level node sibling to it. mdq does _not_ do this: each section's body belongs to that
+    /// section.
+    ///
+    /// Deeper sections will be contained as [`MdElem::Section`]s within this [`Section::body`]. For example, given:
+    ///
+    /// ```markdown
+    /// # This is a title with depth 1
+    ///
+    /// Hello, world.
+    ///
+    /// ## This is a title with depth 2
+    ///
+    /// Alpha, bravo.
+    ///
+    /// # Back to depth 1
+    ///
+    /// Foo, bar.
+    /// ```
+    ///
+    /// ... the tree would look roughly like:
+    ///
+    /// > - This is a title with depth 1
+    /// >
+    /// >   Hello, world.
+    /// >
+    /// >   - This is a title with depth 2
+    /// >
+    /// >   - This is a title with depth 2
+    /// >     Alpha, bravo
+    /// >
+    /// > - Back to depth 1
+    /// >
+    /// >   Foo, bar.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// ### The section title
+    ///
+    /// Some contents
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected = vec![
+    ///     MdElem::Section(Section{
+    ///         depth: 2,
+    ///         title: vec![Inline::Text(Text{
+    ///             variant: TextVariant::Plain,
+    ///             value: "The section title".to_string(),
+    ///         })],
+    ///         body: vec![MdElem::Paragraph(Paragraph{
+    ///             body: vec![Inline::Text(Text{
+    ///                 variant: TextVariant::Plain,
+    ///                 value: "Some contents".to_string(),
+    ///             })],
+    ///         })],
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Section {
         pub depth: u8,
         pub title: Vec<Inline>,
         pub body: Vec<MdElem>,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Leaf block markdown representing a normal paragraph.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// Hello, world
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected = vec![
+    ///     MdElem::Paragraph(Paragraph{
+    ///         body: vec![Inline::Text(Text{
+    ///             variant: TextVariant::Plain,
+    ///             value: "Hello, world".to_string(),
+    ///         })]
+    ///     })
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Paragraph {
         pub body: Vec<Inline>,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Container markdown representing block-quoted text.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// > Hello, world
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected = vec![
+    ///     MdElem::BlockQuote(BlockQuote{
+    ///         body: vec![
+    ///             MdElem::Paragraph(Paragraph{
+    ///                 body: vec![Inline::Text(Text{
+    ///                     variant: TextVariant::Plain,
+    ///                     value: "Hello, world".to_string(),
+    ///                 })]
+    ///             })
+    ///         ]
+    ///     })
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct BlockQuote {
         pub body: Vec<MdElem>,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Container markdown representing a list.
+    ///
+    /// ```markdown
+    /// - hello
+    /// - world
+    /// ```
+    ///
+    /// or
+    ///
+    /// ```markdown
+    /// 1. hello
+    /// 2. world
+    /// ```
+    ///
+    /// If [`List::starting_index`] is `None`, this is an unordered list. If it is `Some`, this is an ordered list,
+    /// starting at the specified index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// - alpha
+    ///
+    /// 1. bravo
+    ///
+    /// - [ ] charlie
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// /// helper fn
+    /// fn paragraph(text: &str) -> Paragraph {
+    ///     Paragraph{
+    ///         body: vec![Inline::Text(Text{
+    ///             variant: TextVariant::Plain,
+    ///             value: text.to_string(),
+    ///         })]
+    ///     }
+    /// }
+    ///
+    /// let unordered_list = List{
+    ///     starting_index: None,
+    ///     items: vec![ListItem{
+    ///         checked: None,
+    ///         item: vec![MdElem::Paragraph(paragraph("alpha"))]
+    ///     }],
+    /// };
+    /// let ordered_list = List{
+    ///     starting_index: Some(1),
+    ///     items: vec![ListItem{
+    ///         checked: None,
+    ///         item: vec![MdElem::Paragraph(paragraph("bravo"))]
+    ///     }],
+    /// };
+    /// let task_list = List{
+    ///     starting_index: None,
+    ///     items: vec![ListItem{
+    ///         checked: Some(false),
+    ///         item: vec![MdElem::Paragraph(paragraph("charlie"))]
+    ///     }],
+    /// };
+    ///
+    /// let expected = vec![
+    ///     MdElem::List(unordered_list),
+    ///     MdElem::List(ordered_list),
+    ///     MdElem::List(task_list),
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct List {
         pub starting_index: Option<u32>,
         pub items: Vec<ListItem>,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Leaf block markdown representing a table.
+    ///
+    /// Tables will always have at least one row, and the length of [`Table::alignments`] should equal the length of
+    /// that first row's `Vec<TableCell>`.
+    ///
+    /// Note that tables have lots of nested vecs: the table's body is a vec of rows, each of which is a vec of cells,
+    /// each of which is a vec of inlines. These can be hard to keep track of, so we provide the [`TableRow`] and
+    /// [`TableCell`] type aliases to help keep track of things.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r"
+    /// | Header 1 | Header 2 |
+    /// |:--------:|----------|
+    /// |  Hello   | World    |
+    /// ";
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// /// helper: note that a cell is a Vec of Inlines!
+    /// fn plain_text_cell(text: &str) -> TableCell {
+    ///     vec![Inline::Text(Text{
+    ///         variant: TextVariant::Plain,
+    ///         value: text.to_string()
+    ///     })]
+    /// }
+    ///
+    /// let expected_full_md = vec![
+    ///     MdElem::Table(Table{
+    ///         alignments: vec![Some(ColumnAlignment::Center), None],
+    ///         rows: vec![
+    ///             vec![plain_text_cell("Header 1"), plain_text_cell("Header 2")],
+    ///             vec![plain_text_cell("Hello"), plain_text_cell("World")],
+    ///         ],
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected_full_md);
+    /// ```
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Table {
         pub alignments: Vec<Option<ColumnAlignment>>,
+        /// The table's rows. Each `TableRow` is a `Vec<TableCell>`, and each `TableCell` is a `Vec<Inline>`. It can
+        /// get confusing to iterate these nested vecs!
+        ///
+        /// The first row is the header row.
         pub rows: Vec<TableRow>,
     }
 
-    #[derive(Debug, PartialEq, Clone, Copy)]
+    /// Left, right, or center for table columns.
+    ///
+    /// This enum does not define "no alignment". It is typically used in an `Option<ColumnAlignment>`, where "no
+    /// alignment" is represented as `None`.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum ColumnAlignment {
         Left,
         Right,
         Center,
     }
 
-    #[derive(Debug, PartialEq, Clone)]
+    /// Leaf block markdown representing a code block.
+    ///
+    /// This includes "code-like" blocks like yaml and block-level math, which some variants of Markdown support.
+    ///
+    /// # Examples
+    ///
+    /// ````
+    /// use mdq::md_elem::{*, elem::*};
+    /// let md_text = r#"
+    /// ```rust title=example.rs
+    /// println!("Hello, world!");
+    /// ```
+    /// "#;
+    ///
+    /// let parsed = MdDoc::parse(md_text, &ParseOptions::gfm()).unwrap();
+    ///
+    /// let expected = vec![
+    ///     MdElem::CodeBlock(CodeBlock{
+    ///         variant: CodeVariant::Code(Some(CodeOpts{
+    ///             language: "rust".to_string(),
+    ///             metadata: Some("title=example.rs".to_string())
+    ///         })),
+    ///         value: r#"println!("Hello, world!");"#.to_string(),
+    ///     }),
+    /// ];
+    /// assert_eq!(parsed.roots, expected);
+    /// ````
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct CodeBlock {
+        /// The type of code block
         pub variant: CodeVariant,
+        /// The contents of the code block; everything between the fence lines, or the indented contents.
         pub value: String,
     }
 
-    /// See https://github.github.com/gfm/#link-reference-definitions
-    #[derive(Debug, PartialEq, Eq, Clone, Hash)]
+    /// A [LinkDefinition]'s reference style.
+    ///
+    /// See <https://github.github.com/gfm/#link-reference-definitions>
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum LinkReference {
+        /// ```markdown
+        /// [hello](https://example.com/world)
+        /// ```
         Inline,
+
+        /// ```markdown
+        /// [hello][hello-link]
+        ///
+        /// [hello-link]: https://example.com/world
+        /// ```
+        ///
+        /// This includes numbered links:
+        ///
+        /// ```markdown
+        /// [hello][1]
+        ///
+        /// [1]: https://example.com/world
+        /// ```
         Full(String),
+
+        /// ```markdown
+        /// [hello][]
+        ///
+        /// [hello]: https://example.com/world
+        /// ```
         Collapsed,
+
+        /// ```markdown
+        /// [hello]
+        ///
+        /// [hello]: https://example.com/world
+        /// ```
         Shortcut,
     }
 
-    #[derive(Debug, PartialEq, Hash, Clone)]
+    /// Supporting struct representing the metadata on a fenced code block.
+    ///
+    /// Given the markdown:
+    ///
+    /// ````markdown
+    /// ```rust foo
+    /// println!("hello, world");
+    /// ```
+    /// ````
+    ///
+    /// ... this struct represents the ` ```rust foo ` part.
+    ///
+    /// See [`CodeVariant::Code`]
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct CodeOpts {
         pub language: String,
         pub metadata: Option<String>,
@@ -403,13 +1240,13 @@ macro_rules! mdx_nodes {
 /// Creates a nested enum.
 ///
 /// This macro translates:
-/// ```compile_fail
-/// m_node!(A::B::C { foo: 123 }
+/// ```text
+/// m_node!(A::B::C { foo: 123 })
 /// ```
 ///
 /// into:
 ///
-/// ```compile_fail
+/// ```text
 /// A::B(B::C(C { foo: 123 }))
 /// ```
 macro_rules! m_node {
@@ -452,7 +1289,9 @@ impl MdElem {
                 let mut li_nodes = Vec::with_capacity(node.children.len());
                 for node in node.children {
                     let mdast::Node::ListItem(li_node) = node else {
-                        return Err(InvalidMd::NonListItemDirectlyUnderList(node));
+                        return Err(InvalidMd::NonListItemDirectlyUnderList(MarkdownPart {
+                            node: Box::new(node),
+                        }));
                     };
                     let li_mdq = ListItem {
                         checked: li_node.checked,
@@ -498,16 +1337,16 @@ impl MdElem {
                 link: lookups.resolve_link(node.identifier, node.label, node.reference_kind, lookups)?,
             })),
             mdast::Node::Link(node) => MdElem::Inline(Inline::Link(Link {
-                text: MdElem::inlines(node.children, lookups, ctx)?,
-                link_definition: LinkDefinition {
+                display: MdElem::inlines(node.children, lookups, ctx)?,
+                link: LinkDefinition {
                     url: node.url,
                     title: node.title,
                     reference: LinkReference::Inline,
                 },
             })),
             mdast::Node::LinkReference(node) => MdElem::Inline(Inline::Link(Link {
-                text: MdElem::inlines(node.children, lookups, ctx)?,
-                link_definition: lookups.resolve_link(node.identifier, node.label, node.reference_kind, lookups)?,
+                display: MdElem::inlines(node.children, lookups, ctx)?,
+                link: lookups.resolve_link(node.identifier, node.label, node.reference_kind, lookups)?,
             })),
             mdast::Node::FootnoteReference(node) => {
                 MdElem::Inline(Inline::Footnote(FootnoteId::new(node.identifier, node.label)))
@@ -518,6 +1357,9 @@ impl MdElem {
                     Err(InvalidMd::ConflictingReferenceDefinition(footnote_id.id))
                 } else {
                     let children = MdElem::all(node.children, lookups, ctx)?;
+
+                    // Can't use HashMap::entry without cloning footnote_id.
+                    #[allow(clippy::map_entry)]
                     if ctx.footnotes.contains_key(&footnote_id) {
                         Err(InvalidMd::ConflictingReferenceDefinition(footnote_id.id))
                     } else {
@@ -538,13 +1380,10 @@ impl MdElem {
                 let mdast::Code { value, lang, meta, .. } = node;
                 m_node!(MdElem::CodeBlock {
                     value,
-                    variant: CodeVariant::Code(match lang {
-                        None => None,
-                        Some(lang) => Some(CodeOpts {
-                            language: lang,
-                            metadata: meta,
-                        }),
-                    }),
+                    variant: CodeVariant::Code(lang.map(|lang| CodeOpts {
+                        language: lang,
+                        metadata: meta,
+                    })),
                 })
             }
             mdast::Node::Math(node) => {
@@ -567,12 +1406,16 @@ impl MdElem {
                         children: cell_nodes, ..
                     }) = row_node
                     else {
-                        return Err(InvalidMd::NonRowDirectlyUnderTable(row_node));
+                        return Err(InvalidMd::NonRowDirectlyUnderTable(MarkdownPart {
+                            node: Box::new(row_node),
+                        }));
                     };
                     let mut column = Vec::with_capacity(cell_nodes.len());
                     for cell_node in cell_nodes {
                         let mdast::Node::TableCell(table_cell) = cell_node else {
-                            return Err(InvalidMd::InternalError(InternalErrorState(Backtrace::force_capture())));
+                            return Err(InvalidMd::InternalError(UnknownMdParseError {
+                                backtrace: Backtrace::force_capture(),
+                            }));
                         };
                         let cell_contents = Self::inlines(table_cell.children, lookups, ctx)?;
                         column.push(cell_contents);
@@ -587,7 +1430,9 @@ impl MdElem {
             mdast::Node::ThematicBreak(_) => m_node!(MdElem::ThematicBreak),
             mdast::Node::TableRow(_) | mdast::Node::TableCell(_) | mdast::Node::ListItem(_) => {
                 // should have been handled by Node::Table
-                return Err(InvalidMd::InternalError(InternalErrorState(Backtrace::force_capture())));
+                return Err(InvalidMd::InternalError(UnknownMdParseError {
+                    backtrace: Backtrace::force_capture(),
+                }));
             }
             mdast::Node::Definition(_) => return Ok(Vec::new()),
             mdast::Node::Paragraph(node) => m_node!(MdElem::Paragraph {
@@ -605,7 +1450,7 @@ impl MdElem {
             mdx_nodes! {} => {
                 // If you implement this, make sure to remove the mdx_nodes macro. That means you'll also need to
                 // adjust the test `nodes_matcher` macro.
-                return Err(InvalidMd::Unsupported(node));
+                return Err(InvalidMd::Unsupported(MarkdownPart { node: Box::new(node) }));
             }
         };
         Ok(vec![result])
@@ -723,7 +1568,7 @@ impl MdElem {
             })
             .for_each(|mdq_node| result.push(mdq_node));
 
-        result.shrink_to_fit();
+        let result = Concatenate::concatenate_similar(result);
         Ok(result)
     }
 
@@ -740,30 +1585,24 @@ impl MdElem {
             let inline = match child {
                 MdElem::Inline(inline) => inline,
                 MdElem::BlockHtml(html) => Inline::Text(Text {
-                    variant: TextVariant::Html,
+                    variant: TextVariant::InlineHtml,
                     value: html.value,
                 }),
                 _ => return Err(InvalidMd::NonInlineWhereInlineExpected(child)),
             };
-            // If both this and the previous were plain text, then just combine the texts. This can happen if there was
-            // a Node::Break between them.
-            if let (
-                Some(Inline::Text(Text {
-                    variant: TextVariant::Plain,
-                    value: prev_text,
-                })),
-                Inline::Text(Text {
-                    variant: TextVariant::Plain,
-                    value: new_text,
-                }),
-            ) = (result.last_mut(), &inline)
-            {
-                prev_text.push_str(new_text)
-            } else {
-                result.push(inline);
-            }
+            result.push(inline);
         }
-        Ok(result)
+        let merged = Concatenate::concatenate_similar(result);
+        Ok(merged)
+    }
+}
+
+impl Concatenate for MdElem {
+    fn try_concatenate(&mut self, other: Self) -> Result<(), Self> {
+        match (self, other) {
+            (Self::Inline(me), Self::Inline(other)) => me.try_concatenate(other).map_err(Self::Inline),
+            (_, other) => Err(other),
+        }
     }
 }
 
@@ -777,7 +1616,7 @@ where
     footnotes_repo: &'a mut MdContext,
 }
 
-impl<'a, I> Iterator for NodeToMdqIter<'a, I>
+impl<I> Iterator for NodeToMdqIter<'_, I>
 where
     I: Iterator<Item = mdast::Node>,
 {
@@ -788,9 +1627,7 @@ where
             if let Some(pending) = self.pending.next() {
                 return Some(Ok(pending));
             }
-            let Some(next_node) = self.children.next() else {
-                return None;
-            };
+            let next_node = self.children.next()?;
             match MdElem::from_mdast_0(next_node, self.lookups, self.footnotes_repo) {
                 Ok(mdq_node) => {
                     self.pending = mdq_node.into_iter();
@@ -820,7 +1657,7 @@ impl Lookups {
             allow_unknown_markdown: read_opts.allow_unknown_markdown,
         };
 
-        result.build_lookups(node, &read_opts)?;
+        result.build_lookups(node, read_opts)?;
 
         Ok(result)
     }
@@ -840,7 +1677,7 @@ impl Lookups {
         reference_kind: mdast::ReferenceKind,
         lookups: &Lookups,
     ) -> Result<LinkDefinition, InvalidMd> {
-        if let None = label {
+        if label.is_none() {
             lookups.unknown_markdown("link label was None")?;
         }
         let Some(definition) = self.link_definitions.get(&identifier) else {
@@ -1318,11 +2155,11 @@ mod tests {
                     assert_eq!(body, vec![
                         mdq_inline!("In "),
                         Inline::Text (Text{
-                            variant: TextVariant::Html,
+                            variant: TextVariant::InlineHtml,
                             value: "<em>".to_string()}),
                         mdq_inline!("a paragraph."),
                         Inline::Text (Text{
-                            variant: TextVariant::Html,
+                            variant: TextVariant::InlineHtml,
                             value: "</em>".to_string()}),
                     ])
                 });
@@ -1338,11 +2175,11 @@ mod tests {
                     assert_eq!(body, vec![
                         mdq_inline!("In "),
                         Inline::Text (Text{
-                            variant: TextVariant::Html,
+                            variant: TextVariant::InlineHtml,
                             value: "<em\nnewline  >".to_string()}),
                         mdq_inline!("a paragraph."),
                         Inline::Text (Text{
-                            variant: TextVariant::Html,
+                            variant: TextVariant::InlineHtml,
                             value: "</em>".to_string()}),
                     ])
                 });
@@ -1425,14 +2262,14 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::Link(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             mdq_inline!("hello "),
                             Inline::Span(Span{
                                 variant: SpanVariant::Emphasis,
                                 children: vec![mdq_inline!("world")],
                             })
                         ],
-                        link_definition: LinkDefinition{
+                        link: LinkDefinition{
                             url: "https://example.com".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
@@ -1447,14 +2284,14 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::Link(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             mdq_inline!("hello "),
                             Inline::Span(Span {
                                 variant: SpanVariant::Emphasis,
                                 children: vec![mdq_inline!("world")],
                             })
                         ],
-                        link_definition: LinkDefinition{
+                        link: LinkDefinition{
                             url: "https://example.com".to_string(),
                             title: Some("the title".to_string()),
                             reference: LinkReference::Inline,
@@ -1476,14 +2313,14 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             mdq_inline!("hello "),
                             Inline::Span(Span{
                                 variant: SpanVariant::Emphasis,
                                 children: vec![mdq_inline!("world")],
                             }),
                         ],
-                        link_definition: LinkDefinition{
+                        link: LinkDefinition{
                             url: "https://example.com".to_string(),
                             title: None,
                             reference: LinkReference::Full("1".to_string()),
@@ -1506,14 +2343,14 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             mdq_inline!("hello "),
                             Inline::Span(Span{
                                 variant: SpanVariant::Emphasis,
                                 children: vec![mdq_inline!("world")],
                             }),
                         ],
-                        link_definition: LinkDefinition{
+                        link: LinkDefinition{
                             url: "https://example.com".to_string(),
                             title: Some("my title".to_string()),
                             reference: LinkReference::Collapsed,
@@ -1536,14 +2373,14 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             mdq_inline!("hello "),
                             Inline::Span(Span{
                                 variant: SpanVariant::Emphasis,
                                 children: vec![mdq_inline!("world")],
                             }),
                         ],
-                        link_definition: LinkDefinition{
+                        link: LinkDefinition{
                             url: "https://example.com".to_string(),
                             title: None,
                             reference: LinkReference::Shortcut,
@@ -1560,9 +2397,9 @@ mod tests {
                 let (root, lookups) = parse("<https://example.com>");
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 assert_eq!(p.children.len(), 1);
-                check!(&p.children[0], Node::Link(_), lookups => m_node!(MdElem::Inline::Link{text, link_definition}) = {
-                    assert_eq!(text, vec![mdq_inline!("https://example.com")]);
-                    assert_eq!(link_definition, LinkDefinition{
+                check!(&p.children[0], Node::Link(_), lookups => m_node!(MdElem::Inline::Link{display, link}) = {
+                    assert_eq!(display, vec![mdq_inline!("https://example.com")]);
+                    assert_eq!(link, LinkDefinition{
                         url: "https://example.com".to_string(),
                         title: None,reference: LinkReference::Inline,
                     });
@@ -1572,9 +2409,9 @@ mod tests {
                 let (root, lookups) = parse("<mailto:md@example.com>");
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 assert_eq!(p.children.len(), 1);
-                check!(&p.children[0], Node::Link(_), lookups => m_node!(MdElem::Inline::Link{text, link_definition}) = {
-                    assert_eq!(text, vec![mdq_inline!("mailto:md@example.com")]);
-                    assert_eq!(link_definition, LinkDefinition{
+                check!(&p.children[0], Node::Link(_), lookups => m_node!(MdElem::Inline::Link{display, link}) = {
+                    assert_eq!(display, vec![mdq_inline!("mailto:md@example.com")]);
+                    assert_eq!(link, LinkDefinition{
                         url: "mailto:md@example.com".to_string(),
                         title: None,reference: LinkReference::Inline,
                     });
@@ -1594,9 +2431,9 @@ mod tests {
                 let (root, lookups) = parse_with(&ParseOptions::gfm(), "https://example.com");
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 assert_eq!(p.children.len(), 1);
-                check!(&p.children[0], Node::Link(_), lookups => m_node!(MdElem::Inline::Link{text, link_definition}) = {
-                    assert_eq!(text, vec![mdq_inline!("https://example.com")]);
-                    assert_eq!(link_definition, LinkDefinition{
+                check!(&p.children[0], Node::Link(_), lookups => m_node!(MdElem::Inline::Link{display, link}) = {
+                    assert_eq!(display, vec![mdq_inline!("https://example.com")]);
+                    assert_eq!(link, LinkDefinition{
                         url: "https://example.com".to_string(),
                         title: None,reference: LinkReference::Inline,
                     });
@@ -1698,8 +2535,8 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![],
-                        link_definition: LinkDefinition {
+                        display: vec![],
+                        link: LinkDefinition {
                             url: "https://example.com/image.png".to_string(),
                             title: None,
                             reference: LinkReference::Full("1".to_string()),
@@ -1716,8 +2553,8 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![],
-                        link_definition: LinkDefinition {
+                        display: vec![],
+                        link: LinkDefinition {
                             url: "https://example.com/image.png".to_string(),
                             title: Some("my title".to_string()),
                             reference: LinkReference::Full("1".to_string()),
@@ -1737,7 +2574,7 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             Inline::Span(Span{
                                 variant: SpanVariant::Emphasis,
                                 children: vec![
@@ -1747,7 +2584,7 @@ mod tests {
                             Inline::Text (Text{variant: TextVariant::Plain,value: " text".to_string()})
 
                         ],
-                        link_definition: LinkDefinition {
+                        link: LinkDefinition {
                             url: "https://example.com/image.png".to_string(),
                             title: Some("my title".to_string()),
                             reference: LinkReference::Collapsed,
@@ -1767,10 +2604,10 @@ mod tests {
                 unwrap!(&root.children[0], Node::Paragraph(p));
                 check!(&p.children[0], Node::LinkReference(_), lookups => MdElem::Inline(link) = {
                     assert_eq!(link, Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             Inline::Text (Text{variant: TextVariant::Plain,value: "my text".to_string()}),
                         ],
-                        link_definition: LinkDefinition {
+                        link: LinkDefinition {
                             url: "https://example.com/image.png".to_string(),
                             title: None,
                             reference: LinkReference::Shortcut,
@@ -2301,7 +3138,7 @@ mod tests {
                     }),
                 ],
             })];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2334,7 +3171,7 @@ mod tests {
                     })],
                 })],
             })];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2395,7 +3232,7 @@ mod tests {
                     }),
                 ],
             })];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2418,7 +3255,7 @@ mod tests {
                     body: vec![mdq_inline!("two")],
                 }),
             ];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2467,7 +3304,7 @@ mod tests {
                     }),
                 ],
             })];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2508,7 +3345,7 @@ mod tests {
                     body: vec![],
                 }),
             ];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2540,7 +3377,7 @@ mod tests {
                     })],
                 }),
             ];
-            let actual = MdElem::all_from_iter(linear.into_iter().map(|n| Ok(n)))?;
+            let actual = MdElem::all_from_iter(linear.into_iter().map(Ok))?;
             assert_eq!(expect, actual);
             Ok(())
         }
@@ -2574,11 +3411,11 @@ mod tests {
                 root_elems,
                 vec![MdElem::Paragraph(Paragraph {
                     body: vec![Inline::Link(Link {
-                        text: vec![Inline::Text(Text {
+                        display: vec![Inline::Text(Text {
                             variant: TextVariant::Plain,
                             value: expected.to_string(),
                         })],
-                        link_definition: LinkDefinition {
+                        link: LinkDefinition {
                             url: "https://example.com".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
@@ -2589,8 +3426,112 @@ mod tests {
         }
     }
 
+    mod concats {
+        use super::*;
+        use SpanVariant::*;
+        use TextVariant::*;
+
+        #[test]
+        fn em_span_to_em_span() {
+            check(
+                [span(Emphasis, "hello, "), span(Emphasis, "world")],
+                [span(Emphasis, "hello, world")],
+            );
+        }
+
+        #[test]
+        fn strong_span_to_strong_span() {
+            check(
+                [span(Strong, "hello, "), span(Strong, "world")],
+                [span(Strong, "hello, world")],
+            );
+        }
+
+        #[test]
+        fn strong_span_to_em_span() {
+            check(
+                [span(Strong, "hello, "), span(Emphasis, "world")],
+                [span(Strong, "hello, "), span(Emphasis, "world")],
+            );
+        }
+
+        #[test]
+        fn plain_text_to_plain_text() {
+            check(
+                [text(Plain, "hello, "), text(Plain, "world")],
+                [text(Plain, "hello, world")],
+            );
+        }
+
+        #[test]
+        fn code_to_code() {
+            // don't concat code
+            check(
+                [text(Code, "hello, "), text(Code, "world")],
+                [text(Code, "hello, "), text(Code, "world")],
+            );
+        }
+
+        #[test]
+        fn math_to_math() {
+            // don't concat math
+            check(
+                [text(Math, "hello, "), text(Math, "world")],
+                [text(Math, "hello, "), text(Math, "world")],
+            );
+        }
+
+        #[test]
+        fn plain_text_to_code() {
+            check(
+                [text(Plain, "hello, "), text(Code, "world")],
+                [text(Plain, "hello, "), text(Code, "world")],
+            );
+        }
+
+        #[test]
+        fn empty() {
+            check([], []);
+        }
+
+        #[test]
+        fn multiple() {
+            check(
+                [
+                    span(Emphasis, "a"),
+                    span(Emphasis, "b"),
+                    span(Emphasis, "c"),
+                    span(Strong, "d"),
+                    span(Strong, "e"),
+                    span(Emphasis, "f"),
+                ],
+                [span(Emphasis, "abc"), span(Strong, "de"), span(Emphasis, "f")],
+            );
+        }
+
+        fn check<const N: usize, const M: usize>(incoming: [Inline; N], expected: [Inline; M]) {
+            let actual = Concatenate::concatenate_similar(incoming.into_iter().collect());
+            let expected: Vec<_> = expected.into_iter().collect();
+            assert_eq!(actual, expected);
+        }
+
+        fn text(variant: TextVariant, value: &str) -> Inline {
+            Inline::Text(Text {
+                variant,
+                value: value.to_string(),
+            })
+        }
+
+        fn span(variant: SpanVariant, value: &str) -> Inline {
+            Inline::Span(Span {
+                variant,
+                children: vec![text(Plain, value)],
+            })
+        }
+    }
+
     /// A simple representation of some nodes. Very non-exhaustive, just for testing.
-    fn simple_to_string(nodes: &Vec<mdast::Node>) -> String {
+    fn simple_to_string(nodes: &[mdast::Node]) -> String {
         fn build(out: &mut String, node: &mdast::Node) {
             let (tag, text) = match node {
                 mdast::Node::Text(text_node) => ("", text_node.value.as_str()),
@@ -2615,15 +3556,8 @@ mod tests {
     }
 
     fn internal_error() -> InvalidMd {
-        InvalidMd::InternalError(InternalErrorState(Backtrace::force_capture()))
-    }
-
-    impl Default for ReadOptions {
-        fn default() -> Self {
-            Self {
-                validate_no_conflicting_links: false,
-                allow_unknown_markdown: false,
-            }
-        }
+        InvalidMd::InternalError(UnknownMdParseError {
+            backtrace: Backtrace::force_capture(),
+        })
     }
 }

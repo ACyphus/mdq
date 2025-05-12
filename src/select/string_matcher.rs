@@ -2,7 +2,7 @@ use crate::md_elem::elem::*;
 use crate::md_elem::*;
 use crate::output::inlines_to_plain_string;
 use crate::select::Matcher;
-use regex::Regex;
+use fancy_regex::Regex;
 use std::borrow::Borrow;
 
 #[derive(Debug)]
@@ -18,7 +18,12 @@ impl PartialEq for StringMatcher {
 
 impl StringMatcher {
     pub fn matches(&self, haystack: &str) -> bool {
-        self.re.is_match(haystack)
+        match self.re.is_match(haystack) {
+            Ok(m) => m,
+            Err(e) => {
+                panic!("failed to evaluate regular expression: {e}");
+            }
+        }
     }
 
     pub fn matches_inlines<I: Borrow<Inline>>(&self, haystack: &[I]) -> bool {
@@ -31,7 +36,7 @@ impl StringMatcher {
 
     fn matches_node(&self, node: &MdElem) -> bool {
         match node {
-            MdElem::Doc(elems) => self.matches_any(&elems),
+            MdElem::Doc(elems) => self.matches_any(elems),
             MdElem::Paragraph(p) => self.matches_inlines(&p.body),
             MdElem::ThematicBreak | MdElem::CodeBlock(_) => false,
             MdElem::Table(table) => {
@@ -84,7 +89,7 @@ impl From<Matcher> for StringMatcher {
             }
             .to_string_matcher(),
             Matcher::Regex(re) => Self::regex(re.re),
-            Matcher::Any(_) => Self::any(),
+            Matcher::Any { .. } => Self::any(),
         }
     }
 }
@@ -106,7 +111,7 @@ impl SubstringToRegex {
         if self.anchor_start {
             pattern.push('^');
         }
-        pattern.push_str(&regex::escape(&self.look_for));
+        pattern.push_str(&fancy_regex::escape(&self.look_for));
         if self.anchor_end {
             pattern.push('$');
         }
@@ -119,7 +124,7 @@ impl SubstringToRegex {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::query::StringVariant;
+    use crate::query::{ParseError, StringVariant};
     use std::str::FromStr;
 
     #[test]
@@ -140,17 +145,17 @@ mod test {
     #[test]
     fn bareword_anchor_start() {
         let m = parse_and_check("^ hello |after", re_insensitive("^hello"), "|after");
-        assert_eq!(false, m.matches("pre hello"));
-        assert_eq!(true, m.matches("hello"));
-        assert_eq!(true, m.matches("hello post"));
+        assert!(!m.matches("pre hello"));
+        assert!(m.matches("hello"));
+        assert!(m.matches("hello post"));
     }
 
     #[test]
     fn bareword_anchor_end() {
         let m = parse_and_check(" hello $ |after", re_insensitive("hello$"), "|after");
-        assert_eq!(true, m.matches("pre hello"));
-        assert_eq!(true, m.matches("hello"));
-        assert_eq!(false, m.matches("hello post"));
+        assert!(m.matches("pre hello"));
+        assert!(m.matches("hello"));
+        assert!(!m.matches("hello post"));
     }
 
     #[test]
@@ -168,9 +173,9 @@ mod test {
     #[test]
     fn only_both_anchors() {
         let matcher = parse_and_check("^$ |after", re("^$"), "|after");
-        assert_eq!(matcher.matches(""), true);
-        assert_eq!(matcher.matches("x"), false);
-        assert_eq!(matcher.matches("\n"), false);
+        assert!(matcher.matches(""));
+        assert!(!matcher.matches("x"));
+        assert!(!matcher.matches("\n"));
 
         parse_and_check("^  $ |after", re("^$"), "|after");
     }
@@ -178,31 +183,31 @@ mod test {
     #[test]
     fn bareword_case_sensitivity() {
         let m = parse_and_check("hello", re_insensitive("hello"), "");
-        assert_eq!(true, m.matches("hello"));
-        assert_eq!(true, m.matches("HELLO"));
+        assert!(m.matches("hello"));
+        assert!(m.matches("HELLO"));
     }
 
     #[test]
     fn quoted_case_sensitivity() {
         let m = parse_and_check("'hello'", re("hello"), "");
-        assert_eq!(true, m.matches("hello"));
-        assert_eq!(false, m.matches("HELLO"));
+        assert!(m.matches("hello"));
+        assert!(!m.matches("HELLO"));
     }
 
     #[test]
     fn quoted_anchor_start() {
         let m = parse_and_check("^'hello'", re("^hello"), "");
-        assert_eq!(false, m.matches("pre hello"));
-        assert_eq!(true, m.matches("hello"));
-        assert_eq!(true, m.matches("hello post"));
+        assert!(!m.matches("pre hello"));
+        assert!(m.matches("hello"));
+        assert!(m.matches("hello post"));
     }
 
     #[test]
     fn quoted_anchor_end() {
         let m = parse_and_check("'hello'$", re("hello$"), "");
-        assert_eq!(true, m.matches("pre hello"));
-        assert_eq!(true, m.matches("hello"));
-        assert_eq!(false, m.matches("hello post"));
+        assert!(m.matches("pre hello"));
+        assert!(m.matches("hello"));
+        assert!(!m.matches("hello post"));
     }
 
     #[test]
@@ -221,8 +226,8 @@ mod test {
     #[test]
     fn bareword_regex_char() {
         let m = parse_and_check("hello.world", re_insensitive("hello\\.world"), "");
-        assert_eq!(true, m.matches("hello.world"));
-        assert_eq!(false, m.matches("hello world")); // the period is _not_ a regex any
+        assert!(m.matches("hello.world"));
+        assert!(!m.matches("hello world")); // the period is _not_ a regex any
     }
 
     #[test]
@@ -307,12 +312,21 @@ mod test {
     #[test]
     fn any() {
         let empty_matcher = parse_and_check("| rest", StringMatcher::any(), "| rest");
-        assert_eq!(empty_matcher.matches(""), true);
+        assert!(empty_matcher.matches(""));
 
         parse_and_check("| rest", StringMatcher::any(), "| rest");
         parse_and_check("*| rest", StringMatcher::any(), "| rest");
         parse_and_check("* | rest", StringMatcher::any(), "| rest");
         parse_and_check_with(StringVariant::AngleBracket, "> rest", StringMatcher::any(), "> rest");
+    }
+
+    /// Test for fancy_regex specific feature (lookaround)
+    #[test]
+    fn fancy_regex_lookahead() {
+        let matcher = re(r#"foo(?=bar)"#); // Positive lookahead: matches "foo" only if followed by "bar"
+        assert!(matcher.matches("foobar"));
+        assert!(!matcher.matches("foo"));
+        assert!(!matcher.matches("foobaz"));
     }
 
     fn parse_and_check_with(
@@ -324,8 +338,8 @@ mod test {
         let (actual_matcher, actual_remaining) = match Matcher::parse(string_variant, text) {
             Ok(parsed) => parsed,
             Err(err) => {
-                eprintln!("{}", err.to_string(text));
-                panic!("{err:?}")
+                let public_err = ParseError::new(err);
+                panic!("{public_err:?}")
             }
         };
         let actual_string_matcher: StringMatcher = actual_matcher.into();
@@ -343,9 +357,8 @@ mod test {
     }
 
     fn expect_err(text: &str) {
-        match Matcher::parse(StringVariant::Pipe, text) {
-            Ok(unexpected) => panic!("unexpected success: {unexpected:?}"),
-            Err(_) => {}
+        if let Ok(unexpected) = Matcher::parse(StringVariant::Pipe, text) {
+            panic!("unexpected success: {unexpected:?}")
         }
     }
 

@@ -14,7 +14,7 @@ use crate::select::Selector;
 use paste::paste;
 use std::collections::HashSet;
 
-pub trait TrySelector<I: Into<MdElem>> {
+pub(crate) trait TrySelector<I: Into<MdElem>> {
     fn try_select(&self, ctx: &MdContext, item: I) -> Result<Vec<MdElem>, MdElem>;
 }
 
@@ -45,7 +45,7 @@ macro_rules! adapters {
         }
 
         impl SelectorAdapter {
-            fn try_select_node<'md>(&self, ctx: &MdContext, node: MdElem) -> Result<Vec<MdElem>, MdElem> {
+            fn try_select_node(&self, ctx: &MdContext, node: MdElem) -> Result<Vec<MdElem>, MdElem> {
                 match (&self, node) {
                     $(
                     (Self::$name(adapter), MdElem::$md_elem(elem)) => adapter.try_select(ctx, elem),
@@ -75,9 +75,8 @@ adapters! {
     }
 }
 
-// TODO this should not be exposed
 impl SelectorAdapter {
-    pub fn find_nodes(&self, ctx: &MdContext, nodes: Vec<MdElem>) -> Vec<MdElem> {
+    pub(crate) fn find_nodes(&self, ctx: &MdContext, nodes: Vec<MdElem>) -> Vec<MdElem> {
         let mut result = Vec::with_capacity(8); // arbitrary guess
         let mut search_context = SearchContext::new(ctx);
         for node in nodes {
@@ -86,8 +85,8 @@ impl SelectorAdapter {
         result
     }
 
-    fn build_output<'md>(&self, out: &mut Vec<MdElem>, ctx: &mut SearchContext<'md>, node: MdElem) {
-        match self.try_select_node(&ctx.md_context, node) {
+    fn build_output(&self, out: &mut Vec<MdElem>, ctx: &mut SearchContext, node: MdElem) {
+        match self.try_select_node(ctx.md_context, node) {
             Ok(mut found) => out.append(&mut found),
             Err(not_found) => {
                 for child in Self::find_children(ctx, not_found) {
@@ -108,12 +107,12 @@ impl SelectorAdapter {
             MdElem::Doc(body) => {
                 let mut wrapped = Vec::with_capacity(body.len());
                 for elem in body {
-                    wrapped.push(elem.into());
+                    wrapped.push(elem);
                 }
                 wrapped
             }
-            MdElem::Section(s) => vec![MdElem::Doc(s.body)], // TODO Should this just be s.body? Should I just get rid of Doc altogether?
-            MdElem::Paragraph(p) => p.body.into_iter().map(|child| MdElem::Inline(child)).collect(),
+            MdElem::Section(s) => vec![MdElem::Doc(s.body)],
+            MdElem::Paragraph(p) => p.body.into_iter().map(MdElem::Inline).collect(),
             MdElem::BlockQuote(b) => vec![MdElem::Doc(b.body)],
             MdElem::List(list) => {
                 let mut result = Vec::with_capacity(list.items.len());
@@ -138,9 +137,7 @@ impl SelectorAdapter {
             }
             MdElem::ThematicBreak | MdElem::CodeBlock(_) => Vec::new(),
             MdElem::Inline(inline) => match inline {
-                Inline::Span(Span { children, .. }) => {
-                    children.into_iter().map(|child| MdElem::Inline(child)).collect()
-                }
+                Inline::Span(Span { children, .. }) => children.into_iter().map(MdElem::Inline).collect(),
                 Inline::Footnote(footnote) => {
                     // guard against cycles
                     if ctx.seen_footnotes.insert(footnote.clone()) {
@@ -149,10 +146,13 @@ impl SelectorAdapter {
                         Vec::new()
                     }
                 }
-                Inline::Text(Text { variant, value }) if variant == TextVariant::Html => {
+                Inline::Text(Text {
+                    variant: TextVariant::InlineHtml,
+                    value,
+                }) => {
                     vec![MdElem::BlockHtml(value.into())]
                 }
-                Inline::Link(Link { text, .. }) => text.into_iter().map(|child| MdElem::Inline(child)).collect(),
+                Inline::Link(Link { display: text, .. }) => text.into_iter().map(MdElem::Inline).collect(),
                 Inline::Text(_) | Inline::Image(_) => Vec::new(),
             },
             MdElem::BlockHtml(_) => Vec::new(),
@@ -186,8 +186,8 @@ mod test {
         #[test]
         fn link_direct() {
             let link = Link {
-                text: vec![mdq_inline!("link text")],
-                link_definition: LinkDefinition {
+                display: vec![mdq_inline!("link text")],
+                link: LinkDefinition {
                     url: "https://example.com".to_string(),
                     title: None,
                     reference: LinkReference::Inline,

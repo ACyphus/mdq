@@ -5,20 +5,56 @@ use crate::output::link_transform::LinkLabel;
 use crate::util::output::{Block, Output, SimpleWrite};
 use crate::util::str_utils::{pad_to, CountingWriter};
 use clap::ValueEnum;
+use derive_builder::Builder;
 use std::borrow::Cow;
 use std::cmp::max;
 use std::ops::Deref;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Builder)]
 pub struct MdWriterOptions {
+    /// Where to put link references (for non-inline links).
     pub link_reference_placement: ReferencePlacement,
+    /// Where to put footnote references.
     pub footnote_reference_placement: ReferencePlacement,
+    /// Inline Markdown options.
     pub inline_options: InlineElemOptions,
+    /// Whether to include thematic breaks between top-level elements.
+    ///
+    /// If `true`, each top-level element will be separated by a thematic break:
+    ///
+    /// ```markdown
+    ///    -----
+    /// ```
+    ///
+    /// Note that "top-level" refers to the nodes you pass into [`MdWriter::write`], not to what might
+    /// otherwise look "top level" to a user. For example, if you were to construct an [`MdElem::Section`] with depth 2,
+    /// and within its body another `Section` with depth 1, only the outer depth-2 `Section` would count as top-level
+    /// for these breaks.
+    ///
+    /// [`MdWriter::write`]: crate::output::MdWriter
     pub include_thematic_breaks: bool,
+    /// Optional text wrapping.
+    ///
+    /// Code blocks will never wrap, and certain inline elements (like URLs) will be treated as atomic: if any part of
+    /// them wraps, the whole thing will wrap, and if it starts a line then it will never wrap.
+    ///
+    /// For example:
+    ///
+    /// <pre>
+    /// ┌────────────────────────────────┐
+    /// │This is a long line that will   │
+    /// │wrap. But                       │
+    /// │[this](https://example.com/will/not/wrap)
+    /// |because it's a URL.             │
+    /// └────────────────────────────────┘
+    /// </pre>
+    ///
+    ///
     pub text_width: Option<usize>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+/// Whether to put link definitions at the end of each section, or at the bottom of the whole document.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, ValueEnum)]
 pub enum ReferencePlacement {
     /// Show link definitions in the first section that uses the link.
     ///
@@ -37,6 +73,7 @@ pub enum ReferencePlacement {
     ///
     /// Lorem ipsum in the second sub-section.
     /// ```
+    #[default]
     Section,
 
     /// Show link definitions at the bottom of the document.
@@ -88,7 +125,7 @@ struct MdWriterState<'s, 'md> {
     inlines_writer: &'s mut MdInlinesWriter<'md>,
 }
 
-impl<'s, 'md> MdWriterState<'s, 'md> {
+impl<'md> MdWriterState<'_, 'md> {
     fn write_md<I, W>(&mut self, out: &mut Output<W>, nodes: I, add_break: bool) -> usize
     where
         I: Iterator<Item = &'md MdElem>,
@@ -140,7 +177,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
                         }
                     });
                 });
-                self.write_md(out, body.into_iter(), false);
+                self.write_md(out, body.iter(), false);
                 self.write_link_refs_as_needed(out);
             }
             MdElem::ThematicBreak => {
@@ -189,7 +226,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
     fn write_block_quote<W: SimpleWrite>(&mut self, out: &mut Output<W>, block: &'md BlockQuote) {
         out.with_block(Block::Quote, |out| {
             let body = &block.body;
-            self.write_md(out, body.into_iter(), false);
+            self.write_md(out, body.iter(), false);
         });
     }
 
@@ -212,7 +249,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
 
         let mut row_strs = Vec::with_capacity(alignments.len());
 
-        let mut column_widths = [0].repeat(alignments.len());
+        let mut column_widths = vec![0; alignments.len()];
         if !alignments.is_empty() {
             for (idx, alignment) in alignments.iter().enumerate() {
                 let width = match *alignment {
@@ -228,7 +265,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
         for row in rows {
             let mut col_strs = Vec::with_capacity(row.len());
             for (idx, cell) in row.iter().enumerate() {
-                let col_str = self.line_to_string(&cell);
+                let col_str = self.line_to_string(cell);
                 // Extend the row_sizes if needed. This happens if we had fewer alignments than columns in any
                 // row. I'm not sure if that's possible, but it's easy to guard against.
                 while column_widths.len() <= idx {
@@ -258,7 +295,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
                 };
                 pad_to(
                     out,
-                    &col,
+                    col,
                     *column_widths.get(idx).unwrap_or(&0) - left_padding_count - 1, // -1 for right padding
                     alignments.get(idx).copied().flatten(),
                 );
@@ -283,7 +320,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
             for (idx, &align) in alignments.iter().enumerate() {
                 let width = column_widths
                     .get(idx)
-                    .unwrap_or_else(|| match align {
+                    .unwrap_or(match align {
                         Some(ColumnAlignment::Left | ColumnAlignment::Right) => &2,
                         Some(ColumnAlignment::Center) => &3,
                         None => &1,
@@ -333,7 +370,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
                 } else {
                     None
                 };
-                let leading_backticks_count = Self::count_longest_opening_backticks(&value);
+                let leading_backticks_count = Self::count_longest_opening_backticks(value);
                 let surround_backticks = if leading_backticks_count < 3 {
                     Cow::Borrowed("```")
                 } else {
@@ -345,7 +382,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
                 let meta = if let Some(meta) = metadata {
                     let mut meta_with_space = String::with_capacity(meta.len() + 1);
                     meta_with_space.push(' ');
-                    meta_with_space.push_str(&meta);
+                    meta_with_space.push_str(meta);
                     Some(meta_with_space)
                 } else {
                     None
@@ -399,7 +436,7 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
         let count = counting_writer.count();
         out.with_block(Block::Indent(count), |out| {
             let body = &item.item;
-            self.write_md(out, body.into_iter(), false);
+            self.write_md(out, body.iter(), false);
         });
     }
 
@@ -448,22 +485,22 @@ impl<'s, 'md> MdWriterState<'s, 'md> {
                     }
                     out.without_wrapping(|out| {
                         out.write_str("]: ");
-                        out.write_str(&link_def.url);
-                        self.inlines_writer.write_url_title(out, &link_def.title);
+                        out.write_str(link_def.url);
+                        self.inlines_writer.write_url_title(out, link_def.title);
                     });
                     newline(out);
                 }
             }
             if matches!(which, DefinitionsToWrite::Footnotes | DefinitionsToWrite::Both) {
                 let mut defs_to_write: Vec<_> = self.inlines_writer.drain_pending_footnotes();
-                defs_to_write.sort_unstable_by(|a, b| (&a.0).cmp(&b.0));
+                defs_to_write.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
                 for (link_ref, text) in defs_to_write {
                     out.write_str("[^");
                     out.write_str(&link_ref);
                     out.write_str("]: ");
                     out.with_block(Block::Indent(2), |out| {
-                        self.write_md(out, text.into_iter(), false);
+                        self.write_md(out, text.iter(), false);
                     });
                 }
             }
@@ -509,16 +546,16 @@ pub mod tests {
         Inline(Inline::Text(Text{variant: TextVariant::Plain, ..})),
         Inline(Inline::Text(Text{variant: TextVariant::Code, ..})),
         Inline(Inline::Text(Text{variant: TextVariant::Math, ..})),
-        Inline(Inline::Text(Text{variant: TextVariant::Html, ..})),
+        Inline(Inline::Text(Text{variant: TextVariant::InlineHtml, ..})),
 
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: None, reference: LinkReference::Inline, ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: None, reference: LinkReference::Full(_), ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: None, reference: LinkReference::Collapsed, ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: None, reference: LinkReference::Shortcut, ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: Some(_), reference: LinkReference::Inline, ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: Some(_), reference: LinkReference::Full(_), ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: Some(_), reference: LinkReference::Collapsed, ..}, ..})),
-        Inline(Inline::Link(Link{link_definition: LinkDefinition{title: Some(_), reference: LinkReference::Shortcut, ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: None, reference: LinkReference::Inline, ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: None, reference: LinkReference::Full(_), ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: None, reference: LinkReference::Collapsed, ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: None, reference: LinkReference::Shortcut, ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: Some(_), reference: LinkReference::Inline, ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: Some(_), reference: LinkReference::Full(_), ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: Some(_), reference: LinkReference::Collapsed, ..}, ..})),
+        Inline(Inline::Link(Link{link: LinkDefinition{title: Some(_), reference: LinkReference::Shortcut, ..}, ..})),
 
         Inline(Inline::Image(Image{link: LinkDefinition{title: None, reference: LinkReference::Inline, ..}, ..})),
         Inline(Inline::Image(Image{link: LinkDefinition{title: None, reference: LinkReference::Full(_), ..}, ..})),
@@ -544,6 +581,11 @@ pub mod tests {
         List(_),
         Table(_),
     });
+
+    #[test]
+    fn reference_placement_default() {
+        assert_eq!(ReferencePlacement::default(), ReferencePlacement::Section);
+    }
 
     #[test]
     fn empty() {
@@ -1457,7 +1499,7 @@ pub mod tests {
             fn html() {
                 check_render(
                     vec![MdElem::Inline(Inline::Text(Text {
-                        variant: TextVariant::Html,
+                        variant: TextVariant::InlineHtml,
                         value: "<a hello />".to_string(),
                     }))],
                     indoc! {"<a hello />"},
@@ -1603,12 +1645,12 @@ pub mod tests {
             fn check_link_and_thematic_break(link: LinkDefinition, expect: &str) {
                 let nodes = vec![
                     MdElem::Inline(Inline::Link(Link {
-                        text: vec![
+                        display: vec![
                             mdq_inline!("hello "),
                             mdq_inline!(span Emphasis [mdq_inline!("world")]),
                             mdq_inline!("!"),
                         ],
-                        link_definition: link,
+                        link,
                     })),
                     m_node!(MdElem::ThematicBreak),
                 ];
@@ -1771,8 +1813,8 @@ pub mod tests {
         fn single_link() {
             check_render_refs(
                 vec![link_elem(Link {
-                    text: vec![mdq_inline!("link text")],
-                    link_definition: LinkDefinition {
+                    display: vec![mdq_inline!("link text")],
+                    link: LinkDefinition {
                         url: "https://example.com".to_string(),
                         title: None,
                         reference: LinkReference::Full("1".to_string()),
@@ -1790,16 +1832,16 @@ pub mod tests {
             check_render_refs(
                 vec![
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text one")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text one")],
+                        link: LinkDefinition {
                             url: "https://example.com/1".to_string(),
                             title: None,
                             reference: LinkReference::Full("1".to_string()),
                         },
                     }),
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text two")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text two")],
+                        link: LinkDefinition {
                             url: "https://example.com/2".to_string(),
                             title: None,
                             reference: LinkReference::Full("2".to_string()),
@@ -1824,16 +1866,16 @@ pub mod tests {
             check_render_refs(
                 vec![
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text one")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text one")],
+                        link: LinkDefinition {
                             url: "https://example.com/1".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
                         },
                     }),
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text two")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text two")],
+                        link: LinkDefinition {
                             url: "https://example.com/2".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
@@ -1857,16 +1899,16 @@ pub mod tests {
                 options,
                 vec![
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text one")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text one")],
+                        link: LinkDefinition {
                             url: "https://example.com/1".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
                         },
                     }),
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text two")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text two")],
+                        link: LinkDefinition {
                             url: "https://example.com/2".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
@@ -1889,16 +1931,16 @@ pub mod tests {
                 options,
                 vec![
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text one")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text one")],
+                        link: LinkDefinition {
                             url: "https://example.com/1".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
                         },
                     }),
                     link_elem(Link {
-                        text: vec![mdq_inline!("link text two")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link text two")],
+                        link: LinkDefinition {
                             url: "https://example.com/2".to_string(),
                             title: None,
                             reference: LinkReference::Inline,
@@ -1920,8 +1962,8 @@ pub mod tests {
             check_render_refs_with(
                 MdWriterOptions::new_with(|mdo| mdo.inline_options.link_format = LinkTransform::Reference),
                 vec![link_elem(Link {
-                    text: vec![mdq_inline!("link text")],
-                    link_definition: LinkDefinition {
+                    display: vec![mdq_inline!("link text")],
+                    link: LinkDefinition {
                         url: "https://example.com".to_string(),
                         title: None,
                         reference: LinkReference::Inline, // note! inline, but will be transformed to full
@@ -2114,8 +2156,8 @@ pub mod tests {
                         body: vec![
                             mdq_inline!("Hello, "),
                             m_node!(Inline::Link {
-                                text: vec![mdq_inline!("world"),],
-                                link_definition: LinkDefinition {
+                                display: vec![mdq_inline!("world"),],
+                                link: LinkDefinition {
                                     url: "https://example.com".to_string(),
                                     title: None,
                                     reference: LinkReference::Full("1".to_string()),
@@ -2195,8 +2237,8 @@ pub mod tests {
                 }),
                 md_elems![Paragraph {
                     body: vec![m_node!(Inline::Link {
-                        text: vec![mdq_inline!("link description")],
-                        link_definition: LinkDefinition {
+                        display: vec![mdq_inline!("link description")],
+                        link: LinkDefinition {
                             url: "https://example.com".to_string(),
                             title: None,
                             reference: LinkReference::Full("1".to_string()),
@@ -2280,16 +2322,16 @@ pub mod tests {
                             Inline::Footnote("d".into()),
                             Inline::Footnote("c".into()),
                             m_node!(Inline::Link {
-                                text: vec![mdq_inline!("b-text")],
-                                link_definition: LinkDefinition {
+                                display: vec![mdq_inline!("b-text")],
+                                link: LinkDefinition {
                                     url: "https://example.com/b".to_string(),
                                     title: None,
                                     reference: LinkReference::Full("b".to_string()),
                                 },
                             }),
                             m_node!(Inline::Link {
-                                text: vec![mdq_inline!("a-text")],
-                                link_definition: LinkDefinition {
+                                display: vec![mdq_inline!("a-text")],
+                                link: LinkDefinition {
                                     url: "https://example.com/a".to_string(),
                                     title: None,
                                     reference: LinkReference::Full("a".to_string()),
@@ -2316,8 +2358,8 @@ pub mod tests {
                     body: md_elems![Paragraph {
                         body: vec![
                             m_node!(Inline::Link {
-                                text: vec![mdq_inline!("link description")],
-                                link_definition: LinkDefinition {
+                                display: vec![mdq_inline!("link description")],
+                                link: LinkDefinition {
                                     url: "https://example.com".to_string(),
                                     title: None,
                                     reference: LinkReference::Full("1".to_string()),
@@ -2353,7 +2395,7 @@ pub mod tests {
                             value: "Hello ".to_string()
                         }),
                         Inline::Text(Text {
-                            variant: TextVariant::Html,
+                            variant: TextVariant::InlineHtml,
                             value: "<span class=\"greeting\">".to_string()
                         }),
                         Inline::Text(Text {
@@ -2361,7 +2403,7 @@ pub mod tests {
                             value: "world".to_string()
                         }),
                         Inline::Text(Text {
-                            variant: TextVariant::Html,
+                            variant: TextVariant::InlineHtml,
                             value: "</span>".to_string()
                         }),
                     ]
